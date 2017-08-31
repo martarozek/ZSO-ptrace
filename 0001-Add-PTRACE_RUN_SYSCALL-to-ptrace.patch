@@ -1,0 +1,275 @@
+From bb8aa6f0aa10900217820503a268054de3817c39 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Marta=20Ro=C5=BCek?= <marta.rozek@gmail.com>
+Date: Wed, 14 Jun 2017 12:55:58 +0200
+Subject: [PATCH] Add PTRACE_RUN_SYSCALL to ptrace.
+
+---
+ linux-4.9.13/arch/x86/entry/common.c     | 53 +++++++++++++++++++++++++++-
+ linux-4.9.13/include/linux/ptrace.h      | 10 +++++-
+ linux-4.9.13/include/linux/sched.h       |  6 ++++
+ linux-4.9.13/include/uapi/linux/ptrace.h |  8 +++++
+ linux-4.9.13/kernel/fork.c               |  1 +
+ linux-4.9.13/kernel/ptrace.c             | 59 ++++++++++++++++++++++++++++++++
+ 6 files changed, 135 insertions(+), 2 deletions(-)
+
+diff --git a/linux-4.9.13/arch/x86/entry/common.c b/linux-4.9.13/arch/x86/entry/common.c
+index bdd9cc5..f81599d 100644
+--- a/linux-4.9.13/arch/x86/entry/common.c
++++ b/linux-4.9.13/arch/x86/entry/common.c
+@@ -21,6 +21,7 @@
+ #include <linux/context_tracking.h>
+ #include <linux/user-return-notifier.h>
+ #include <linux/uprobes.h>
++#include <linux/freezer.h>
+ 
+ #include <asm/desc.h>
+ #include <asm/traps.h>
+@@ -127,6 +128,51 @@ static long syscall_trace_enter(struct pt_regs *regs)
+ 	return ret ?: regs->orig_ax;
+ }
+ 
++static void ptrace_run_syscall(void)
++{
++	current->ptrace_run_syscall_res =
++		sys_call_table[current->ptrace_run_syscall_nr & __SYSCALL_MASK](
++			current->ptrace_run_syscall_args[0],
++			current->ptrace_run_syscall_args[1],
++			current->ptrace_run_syscall_args[2],
++			current->ptrace_run_syscall_args[3],
++			current->ptrace_run_syscall_args[4],
++			current->ptrace_run_syscall_args[5]);
++
++	current->flags &= ~PF_RUN_SYSCALL;
++
++	/* Tell the parent that the syscall is done. */
++	read_lock(&tasklist_lock);
++	if (current->ptrace) {
++		read_unlock(&tasklist_lock);
++		spin_lock_irq(&current->sighand->siglock);
++		complete(&current->ptrace_run_syscall_event);
++		spin_unlock_irq(&current->sighand->siglock);
++	} else {
++		read_unlock(&tasklist_lock);
++	}
++
++	spin_lock_irq(&current->sighand->siglock);
++	set_current_state(TASK_TRACED);
++	spin_unlock_irq(&current->sighand->siglock);
++
++	/* If parent hasn't left in the meantime, stop. */
++	read_lock(&tasklist_lock);
++	if (current->ptrace) {
++		preempt_disable();
++		read_unlock(&tasklist_lock);
++		preempt_enable_no_resched();
++		freezable_schedule();
++	} else {
++		__set_current_state(TASK_RUNNING);
++		read_unlock(&tasklist_lock);
++	}
++
++	spin_lock_irq(&current->sighand->siglock);
++	recalc_sigpending();
++	spin_unlock_irq(&current->sighand->siglock);
++}
++
+ #define EXIT_TO_USERMODE_LOOP_FLAGS				\
+ 	(_TIF_SIGPENDING | _TIF_NOTIFY_RESUME | _TIF_UPROBE |	\
+ 	 _TIF_NEED_RESCHED | _TIF_USER_RETURN_NOTIFY)
+@@ -142,12 +188,16 @@ static void exit_to_usermode_loop(struct pt_regs *regs, u32 cached_flags)
+ 	 * work to clear some of the flags can sleep.
+ 	 */
+ 	while (true) {
++
+ 		/* We have work to do. */
+ 		local_irq_enable();
+ 
+ 		if (cached_flags & _TIF_NEED_RESCHED)
+ 			schedule();
+ 
++		if (current->flags & PF_RUN_SYSCALL)
++			ptrace_run_syscall();
++
+ 		if (cached_flags & _TIF_UPROBE)
+ 			uprobe_notify_resume(regs);
+ 
+@@ -168,7 +218,8 @@ static void exit_to_usermode_loop(struct pt_regs *regs, u32 cached_flags)
+ 
+ 		cached_flags = READ_ONCE(current_thread_info()->flags);
+ 
+-		if (!(cached_flags & EXIT_TO_USERMODE_LOOP_FLAGS))
++		if (!(cached_flags & EXIT_TO_USERMODE_LOOP_FLAGS) &&
++			!(current->flags & PF_RUN_SYSCALL))
+ 			break;
+ 	}
+ }
+diff --git a/linux-4.9.13/include/linux/ptrace.h b/linux-4.9.13/include/linux/ptrace.h
+index e0e5393..4cacde0 100644
+--- a/linux-4.9.13/include/linux/ptrace.h
++++ b/linux-4.9.13/include/linux/ptrace.h
+@@ -144,7 +144,15 @@ static inline bool ptrace_event_enabled(struct task_struct *task, int event)
+  */
+ static inline void ptrace_event(int event, unsigned long message)
+ {
+-	if (unlikely(ptrace_event_enabled(current, event))) {
++	if (current->flags & PF_RUN_SYSCALL) {
++		if (event == PTRACE_EVENT_EXIT) {
++			/* Let know the parent that we exited during syscall. */
++			current->ptrace_run_syscall_flag = 1;
++			complete(&current->ptrace_run_syscall_event);
++		}
++	}
++	if (unlikely(ptrace_event_enabled(current, event))
++		&& !(current->flags & PF_RUN_SYSCALL)) {
+ 		current->ptrace_message = message;
+ 		ptrace_notify((event << 8) | SIGTRAP);
+ 	} else if (event == PTRACE_EVENT_EXEC) {
+diff --git a/linux-4.9.13/include/linux/sched.h b/linux-4.9.13/include/linux/sched.h
+index 75d9a57..d0786a0 100644
+--- a/linux-4.9.13/include/linux/sched.h
++++ b/linux-4.9.13/include/linux/sched.h
+@@ -1485,6 +1485,11 @@ struct task_struct {
+ 	atomic_t usage;
+ 	unsigned int flags;	/* per process flags, defined below */
+ 	unsigned int ptrace;
++	int ptrace_run_syscall_nr;
++	uint64_t ptrace_run_syscall_args[6];
++	uint64_t ptrace_run_syscall_res;
++	unsigned int ptrace_run_syscall_flag; /* 0 normal, 1 exited during syscall */
++	struct completion ptrace_run_syscall_event;
+ 
+ #ifdef CONFIG_SMP
+ 	struct llist_node wake_entry;
+@@ -2279,6 +2284,7 @@ extern void thread_group_cputime_adjusted(struct task_struct *p, cputime_t *ut,
+ #define PF_SWAPWRITE	0x00800000	/* Allowed to write to swap */
+ #define PF_NO_SETAFFINITY 0x04000000	/* Userland is not allowed to meddle with cpus_allowed */
+ #define PF_MCE_EARLY    0x08000000      /* Early kill for mce process policy */
++#define PF_RUN_SYSCALL  0x10000000  /* there is a syscall from ptrace to run */
+ #define PF_MUTEX_TESTER	0x20000000	/* Thread belongs to the rt mutex tester */
+ #define PF_FREEZER_SKIP	0x40000000	/* Freezer should not count it as freezable */
+ #define PF_SUSPEND_TASK 0x80000000      /* this thread called freeze_processes and should not be frozen */
+diff --git a/linux-4.9.13/include/uapi/linux/ptrace.h b/linux-4.9.13/include/uapi/linux/ptrace.h
+index fb81065..7127fb9 100644
+--- a/linux-4.9.13/include/uapi/linux/ptrace.h
++++ b/linux-4.9.13/include/uapi/linux/ptrace.h
+@@ -22,6 +22,7 @@
+ #define PTRACE_DETACH		  17
+ 
+ #define PTRACE_SYSCALL		  24
++#define PTRACE_RUN_SYSCALL    42
+ 
+ /* 0x4200-0x4300 are reserved for architecture-independent additions.  */
+ #define PTRACE_SETOPTIONS	0x4200
+@@ -61,6 +62,13 @@ struct ptrace_peeksiginfo_args {
+ 	__s32 nr;	/* how may siginfos to take */
+ };
+ 
++struct ptrace_run_syscall_args {
++    int nr;
++    uint32_t arch;
++    uint64_t args[6];
++    uint64_t res;
++};
++
+ #define PTRACE_GETSIGMASK	0x420a
+ #define PTRACE_SETSIGMASK	0x420b
+ 
+diff --git a/linux-4.9.13/kernel/fork.c b/linux-4.9.13/kernel/fork.c
+index ba8a015..aacff5d 100644
+--- a/linux-4.9.13/kernel/fork.c
++++ b/linux-4.9.13/kernel/fork.c
+@@ -1701,6 +1701,7 @@ static __latent_entropy struct task_struct *copy_process(
+ 	 */
+ 	user_disable_single_step(p);
+ 	clear_tsk_thread_flag(p, TIF_SYSCALL_TRACE);
++	p->flags &= ~PF_RUN_SYSCALL;
+ #ifdef TIF_SYSCALL_EMU
+ 	clear_tsk_thread_flag(p, TIF_SYSCALL_EMU);
+ #endif
+diff --git a/linux-4.9.13/kernel/ptrace.c b/linux-4.9.13/kernel/ptrace.c
+index 49ba7c1..bf62cee 100644
+--- a/linux-4.9.13/kernel/ptrace.c
++++ b/linux-4.9.13/kernel/ptrace.c
+@@ -27,6 +27,8 @@
+ #include <linux/cn_proc.h>
+ #include <linux/compat.h>
+ 
++#define SHUTDOWN_SIGS   (sigmask(SIGKILL) | sigmask(SIGINT) | sigmask(SIGQUIT) | sigmask(SIGTRAP))
++
+ /*
+  * Access another process' address space via ptrace.
+  * Source/target buffer must be kernel space,
+@@ -859,6 +861,38 @@ static int ptrace_regset(struct task_struct *task, int req, unsigned int type,
+ 					     kiov->iov_len, kiov->iov_base);
+ }
+ 
++static int ptrace_run_syscall(struct task_struct *child,
++			struct ptrace_run_syscall_args *args)
++{
++	sigset_t mask, orig_mask;
++
++	/* Allow only killing signals while waiting for the syscall to complete. */
++	siginitsetinv(&mask, SHUTDOWN_SIGS);
++	sigprocmask(SIG_SETMASK, &mask, &orig_mask);
++
++	init_completion(&child->ptrace_run_syscall_event);
++
++	/* Give the child the syscall args and let it go. */
++	child->ptrace_run_syscall_nr = args->nr;
++	memcpy(child->ptrace_run_syscall_args, args->args, sizeof(args->args));
++	child->ptrace_run_syscall_flag = 0;
++	child->flags |= PF_RUN_SYSCALL;
++
++	ptrace_resume(child, PTRACE_RUN_SYSCALL, 0);
++
++	wait_for_completion_killable(&child->ptrace_run_syscall_event);
++
++	sigprocmask(SIG_SETMASK, &orig_mask, NULL);
++
++	/* Child exited during execution of the syscall. */
++	if (child->ptrace_run_syscall_flag == 1)
++		return 1;
++
++	args->res = child->ptrace_run_syscall_res;
++	return 0;
++}
++
++
+ /*
+  * This is declared in linux/regset.h and defined in machine-dependent
+  * code.  We put the export here, near the primary machine-neutral use,
+@@ -1079,6 +1113,31 @@ int ptrace_request(struct task_struct *child, long request,
+ 		ret = seccomp_get_filter(child, addr, datavp);
+ 		break;
+ 
++	case PTRACE_RUN_SYSCALL: {
++		struct ptrace_run_syscall_args rs_args;
++
++		if (copy_from_user(&rs_args, datavp, sizeof(rs_args))) {
++			ret = -EFAULT;
++			break;
++		}
++
++		if ((rs_args.nr & __SYSCALL_MASK) >= NR_syscalls) {
++			ret = -EFAULT;
++			break;
++		}
++		if (rs_args.arch != AUDIT_ARCH_X86_64) {
++			ret = -EINVAL;
++			break;
++		}
++
++		ret = ptrace_run_syscall(child, &rs_args);
++		if (copy_to_user(datavp, &rs_args, sizeof(rs_args))) {
++			ret = -EFAULT;
++			break;
++		}
++		break;
++	}
++
+ 	default:
+ 		break;
+ 	}
+-- 
+2.11.0
+
